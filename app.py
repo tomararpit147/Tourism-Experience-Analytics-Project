@@ -3,13 +3,13 @@ Tourism Experience Analytics
 Streamlit Application
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pickle
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -24,11 +24,153 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# LOAD ARTIFACTS
+# TRAINING FUNCTION (runs if pkl missing)
 # ─────────────────────────────────────────────
-@st.cache_resource
+def build_artifacts():
+    from sklearn.model_selection import train_test_split
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, mean_squared_error, r2_score
+    from sklearn.linear_model import Ridge
+    from scipy.sparse import csr_matrix
+    from sklearn.neighbors import NearestNeighbors
+
+    BASE = os.path.dirname(os.path.abspath(__file__))
+
+    transaction = pd.read_excel(os.path.join(BASE, "Transaction.xlsx"))
+    user        = pd.read_excel(os.path.join(BASE, "User.xlsx"))
+    city        = pd.read_excel(os.path.join(BASE, "City.xlsx"))
+    type_df     = pd.read_excel(os.path.join(BASE, "Type.xlsx"))
+    mode_df     = pd.read_excel(os.path.join(BASE, "Mode.xlsx"))
+    continent   = pd.read_excel(os.path.join(BASE, "Continent.xlsx"))
+    country     = pd.read_excel(os.path.join(BASE, "Country.xlsx"))
+    region      = pd.read_excel(os.path.join(BASE, "Region.xlsx"))
+    item        = pd.read_excel(os.path.join(BASE, "Updated_Item.xlsx"))
+
+    city      = city[city['CityId'] != 0].copy()
+    mode_df   = mode_df[mode_df['VisitModeId'] != 0].copy()
+    continent = continent[continent['ContinentId'] != 0].copy()
+    country   = country[country['CountryId'] != 0].copy()
+    region    = region[region['RegionId'] != 0].copy()
+
+    user['CityId'] = user['CityId'].fillna(0).astype(int)
+    transaction = transaction[transaction['VisitMode'] != 0].copy()
+    transaction['Rating'] = transaction['Rating'].clip(1, 5)
+
+    df = transaction.merge(user, on='UserId', how='left')
+    df = df.merge(continent.rename(columns={'Continent': 'ContinentName'}), on='ContinentId', how='left')
+    df = df.merge(region[['RegionId', 'Region']], on='RegionId', how='left')
+    df = df.merge(country[['CountryId', 'Country']], on='CountryId', how='left')
+    df = df.merge(city[['CityId', 'CityName']], on='CityId', how='left')
+    df = df.merge(item[['AttractionId', 'AttractionTypeId', 'Attraction', 'AttractionCityId']], on='AttractionId', how='left')
+    df = df.merge(type_df, on='AttractionTypeId', how='left')
+    df = df.merge(mode_df.rename(columns={'VisitModeId': 'VisitMode', 'VisitMode': 'VisitModeName'}), on='VisitMode', how='left')
+
+    attr_avg = transaction.groupby('AttractionId')['Rating'].mean().rename('AttractionAvgRating')
+    df = df.merge(attr_avg, on='AttractionId', how='left')
+    user_features = transaction.groupby('UserId').agg(
+        UserAvgRating=('Rating', 'mean'), UserVisitCount=('TransactionId', 'count')
+    ).reset_index()
+    df = df.merge(user_features, on='UserId', how='left')
+
+    for col in ['ContinentName', 'Region', 'Country', 'CityName', 'Attraction', 'AttractionType', 'VisitModeName']:
+        df[col] = df[col].fillna('Unknown')
+    df['AttractionTypeId']   = df['AttractionTypeId'].fillna(-1).astype(int)
+    df['AttractionAvgRating'] = df['AttractionAvgRating'].fillna(df['Rating'].mean())
+    df['UserAvgRating']       = df['UserAvgRating'].fillna(df['Rating'].mean())
+    df['UserVisitCount']      = df['UserVisitCount'].fillna(1)
+
+    FEATURES_REG   = ['ContinentId','RegionId','CountryId','VisitYear','VisitMonth',
+                      'AttractionTypeId','AttractionAvgRating','UserAvgRating','UserVisitCount']
+    FEATURES_CLASS = FEATURES_REG + ['Rating']
+
+    reg_df = df[FEATURES_REG + ['Rating']].dropna()
+    cls_df = df[FEATURES_CLASS + ['VisitMode']].dropna()
+
+    X_tr, X_te, y_tr, y_te = train_test_split(reg_df[FEATURES_REG], reg_df['Rating'], test_size=0.2, random_state=42)
+    rf_reg = RandomForestRegressor(n_estimators=150, max_depth=10, random_state=42, n_jobs=-1)
+    rf_reg.fit(X_tr, y_tr)
+    y_pred_reg = rf_reg.predict(X_te)
+    r2  = r2_score(y_te, y_pred_reg)
+    mse = mean_squared_error(y_te, y_pred_reg)
+
+    ridge = Ridge(alpha=1.0)
+    ridge.fit(X_tr, y_tr)
+    y_pred_ridge = ridge.predict(X_te)
+    r2_r  = r2_score(y_te, y_pred_ridge)
+    mse_r = mean_squared_error(y_te, y_pred_ridge)
+
+    X_ctr, X_cte, y_ctr, y_cte = train_test_split(cls_df[FEATURES_CLASS], cls_df['VisitMode'],
+                                                    test_size=0.2, random_state=42, stratify=cls_df['VisitMode'])
+    rf_cls = RandomForestClassifier(n_estimators=150, max_depth=12, random_state=42, n_jobs=-1)
+    rf_cls.fit(X_ctr, y_ctr)
+    y_pred_cls = rf_cls.predict(X_cte)
+    acc = accuracy_score(y_cte, y_pred_cls)
+    f1  = f1_score(y_cte, y_pred_cls, average='weighted')
+
+    gb_cls = GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=42)
+    gb_cls.fit(X_ctr, y_ctr)
+    y_pred_gb = gb_cls.predict(X_cte)
+    acc_gb = accuracy_score(y_cte, y_pred_gb)
+    f1_gb  = f1_score(y_cte, y_pred_gb, average='weighted')
+
+    best_cls      = rf_cls if acc >= acc_gb else gb_cls
+    best_cls_name = "RandomForest" if acc >= acc_gb else "GradientBoosting"
+    best_pred     = y_pred_cls if acc >= acc_gb else y_pred_gb
+
+    pivot        = transaction.pivot_table(index='UserId', columns='AttractionId', values='Rating', aggfunc='mean')
+    pivot_filled = pivot.fillna(0)
+    knn_model    = NearestNeighbors(n_neighbors=11, metric='cosine', algorithm='brute', n_jobs=-1)
+    knn_model.fit(csr_matrix(pivot_filled.values))
+
+    artifacts = {
+        'rf_reg': rf_reg, 'ridge_reg': ridge,
+        'best_cls': best_cls, 'best_cls_name': best_cls_name,
+        'knn_model': knn_model, 'pivot_filled': pivot_filled,
+        'features_reg': FEATURES_REG, 'features_cls': FEATURES_CLASS,
+        'df': df,
+        'mode_map':  dict(zip(mode_df['VisitModeId'], mode_df['VisitMode'])),
+        'type_map':  dict(zip(type_df['AttractionTypeId'], type_df['AttractionType'])),
+        'item': item, 'type_df': type_df, 'mode_df': mode_df,
+        'continent': continent, 'region': region, 'country': country,
+        'reg_metrics': {
+            'RandomForest': {'R2': round(r2,4),   'RMSE': round(np.sqrt(mse),4),   'MSE': round(mse,4)},
+            'Ridge':        {'R2': round(r2_r,4),  'RMSE': round(np.sqrt(mse_r),4), 'MSE': round(mse_r,4)},
+        },
+        'cls_metrics': {
+            'RandomForest': {
+                'Accuracy':  round(acc,4),
+                'F1':        round(f1,4),
+                'Precision': round(precision_score(y_cte, y_pred_cls, average='weighted'),4),
+                'Recall':    round(recall_score(y_cte, y_pred_cls, average='weighted'),4),
+            },
+            'GradientBoosting': {
+                'Accuracy':  round(acc_gb,4),
+                'F1':        round(f1_gb,4),
+                'Precision': round(precision_score(y_cte, y_pred_gb, average='weighted'),4),
+                'Recall':    round(recall_score(y_cte, y_pred_gb, average='weighted'),4),
+            },
+        },
+    }
+
+    pkl_path = os.path.join(BASE, "model_artifacts.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(artifacts, f)
+
+    return artifacts
+
+# ─────────────────────────────────────────────
+# LOAD OR BUILD ARTIFACTS
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
 def load_artifacts():
-    with open("model_artifacts.pkl", "rb") as f:
+    BASE     = os.path.dirname(os.path.abspath(__file__))
+    pkl_path = os.path.join(BASE, "model_artifacts.pkl")
+
+    if not os.path.exists(pkl_path):
+        with st.spinner("⚙️ First run — training models on your data. This takes ~2 minutes…"):
+            return build_artifacts()
+
+    with open(pkl_path, "rb") as f:
         return pickle.load(f)
 
 artifacts = load_artifacts()
@@ -52,14 +194,12 @@ FEATURES_REG = artifacts['features_reg']
 FEATURES_CLS = artifacts['features_cls']
 best_cls_name = artifacts['best_cls_name']
 
-# Reverse maps
-mode_rev  = {v: k for k, v in mode_map.items()}
 continent_map = dict(zip(continent_df['ContinentId'], continent_df['Continent']))
 region_map    = dict(zip(region_df['RegionId'], region_df['Region']))
 country_map   = dict(zip(country_df['CountryId'], country_df['Country']))
 
 # ─────────────────────────────────────────────
-# SIDEBAR NAVIGATION
+# SIDEBAR
 # ─────────────────────────────────────────────
 st.sidebar.image("https://img.icons8.com/fluency/96/airplane-mode-on.png", width=80)
 st.sidebar.title("Tourism Analytics")
@@ -79,9 +219,9 @@ if page == "🏠 Overview":
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Transactions", f"{len(df):,}")
-    c2.metric("Unique Users", f"{df['UserId'].nunique():,}")
-    c3.metric("Unique Attractions", f"{df['AttractionId'].nunique():,}")
-    c4.metric("Avg Rating", f"{df['Rating'].mean():.2f} / 5")
+    c2.metric("Unique Users",        f"{df['UserId'].nunique():,}")
+    c3.metric("Unique Attractions",  f"{df['AttractionId'].nunique():,}")
+    c4.metric("Avg Rating",          f"{df['Rating'].mean():.2f} / 5")
 
     st.markdown("---")
     st.subheader("Project Objectives")
@@ -94,7 +234,7 @@ if page == "🏠 Overview":
         st.warning("**🎯 Recommendation**\n\nSuggest personalized tourist attractions using collaborative filtering based on user history and similar users.")
 
     st.markdown("---")
-    st.subheader("Dataset Overview")
+    st.subheader("Dataset Explorer")
     tab1, tab2, tab3 = st.tabs(["Transactions", "Attractions", "Users"])
     with tab1:
         st.dataframe(df[['TransactionId','UserId','VisitYear','VisitMonth','VisitModeName',
@@ -126,7 +266,6 @@ elif page == "📊 EDA & Visualizations":
             fig2 = px.bar(mode_rating, x='VisitModeName', y='Rating', color='Rating',
                           color_continuous_scale='Blues', title="Avg Rating by Visit Mode")
             st.plotly_chart(fig2, use_container_width=True)
-
         col3, col4 = st.columns(2)
         with col3:
             year_rating = df.groupby('VisitYear')['Rating'].mean().reset_index()
@@ -145,7 +284,7 @@ elif page == "📊 EDA & Visualizations":
         col1, col2 = st.columns(2)
         with col1:
             vm_counts = df['VisitModeName'].value_counts().reset_index()
-            vm_counts.columns = ['VisitMode','Count']
+            vm_counts.columns = ['VisitMode', 'Count']
             fig = px.pie(vm_counts, values='Count', names='VisitMode',
                          title="Visit Mode Distribution", hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
@@ -154,7 +293,6 @@ elif page == "📊 EDA & Visualizations":
             fig2 = px.bar(vm_year, x='VisitYear', y='Count', color='VisitModeName',
                           title="Visit Modes Over Years", barmode='stack')
             st.plotly_chart(fig2, use_container_width=True)
-
         vm_month = df.groupby(['VisitMonth','VisitModeName']).size().reset_index(name='Count')
         vm_month['Month'] = pd.to_datetime(vm_month['VisitMonth'], format='%m').dt.strftime('%b')
         fig3 = px.line(vm_month, x='Month', y='Count', color='VisitModeName',
@@ -166,7 +304,7 @@ elif page == "📊 EDA & Visualizations":
         col1, col2 = st.columns(2)
         with col1:
             cont_counts = df['ContinentName'].value_counts().reset_index()
-            cont_counts.columns = ['Continent','Users']
+            cont_counts.columns = ['Continent', 'Users']
             fig = px.bar(cont_counts, x='Continent', y='Users', color='Users',
                          color_continuous_scale='Viridis', title="Users by Continent")
             st.plotly_chart(fig, use_container_width=True)
@@ -175,9 +313,8 @@ elif page == "📊 EDA & Visualizations":
             fig2 = px.bar(cont_rating, x='ContinentName', y='Rating', color='Rating',
                           color_continuous_scale='RdYlGn', title="Avg Rating by Continent")
             st.plotly_chart(fig2, use_container_width=True)
-
         top_countries = df['Country'].value_counts().head(15).reset_index()
-        top_countries.columns = ['Country','Count']
+        top_countries.columns = ['Country', 'Count']
         fig3 = px.bar(top_countries, x='Country', y='Count', color='Count',
                       color_continuous_scale='Blues', title="Top 15 User Countries")
         fig3.update_xaxes(tickangle=45)
@@ -188,7 +325,7 @@ elif page == "📊 EDA & Visualizations":
         col1, col2 = st.columns(2)
         with col1:
             type_counts = df['AttractionType'].value_counts().head(15).reset_index()
-            type_counts.columns = ['AttractionType','Count']
+            type_counts.columns = ['AttractionType', 'Count']
             fig = px.bar(type_counts, x='Count', y='AttractionType', orientation='h',
                          color='Count', color_continuous_scale='Tealgrn',
                          title="Top Attraction Types by Visit Count")
@@ -199,7 +336,6 @@ elif page == "📊 EDA & Visualizations":
                           color='Rating', color_continuous_scale='RdYlGn',
                           title="Avg Rating by Attraction Type (Top 15)")
             st.plotly_chart(fig2, use_container_width=True)
-
         top_attractions = df.groupby('Attraction').agg(
             AvgRating=('Rating','mean'), Visits=('TransactionId','count')
         ).reset_index().nlargest(20, 'Visits')
@@ -221,8 +357,8 @@ elif page == "⭐ Rating Prediction":
     with col1:
         st.subheader("User Demographics")
         continent_opts = {v: k for k, v in continent_map.items()}
-        sel_continent = st.selectbox("Continent", list(continent_opts.keys()))
-        continent_id  = continent_opts[sel_continent]
+        sel_continent  = st.selectbox("Continent", list(continent_opts.keys()))
+        continent_id   = continent_opts[sel_continent]
 
         region_subset = region_df[region_df['ContinentId'] == continent_id]
         region_opts   = dict(zip(region_subset['Region'], region_subset['RegionId']))
@@ -237,15 +373,14 @@ elif page == "⭐ Rating Prediction":
         visit_year  = st.selectbox("Visit Year", list(range(2013, 2024)), index=9)
         visit_month = st.selectbox("Visit Month", list(range(1, 13)),
                                    format_func=lambda x: pd.Timestamp(2024, x, 1).strftime('%B'))
-
     with col2:
         st.subheader("Attraction Details")
         type_opts    = dict(zip(type_df['AttractionType'], type_df['AttractionTypeId']))
         sel_type     = st.selectbox("Attraction Type", list(type_opts.keys()))
         attr_type_id = type_opts[sel_type]
 
-        attr_avg_rating = st.slider("Attraction's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1)
-        user_avg_rating = st.slider("User's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1)
+        attr_avg_rating  = st.slider("Attraction's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1)
+        user_avg_rating  = st.slider("User's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1)
         user_visit_count = st.number_input("User's Total Visit Count", min_value=1, max_value=500, value=10)
 
     st.markdown("---")
@@ -253,26 +388,23 @@ elif page == "⭐ Rating Prediction":
         input_data = pd.DataFrame([[continent_id, region_id, country_id, visit_year, visit_month,
                                     attr_type_id, attr_avg_rating, user_avg_rating, user_visit_count]],
                                   columns=FEATURES_REG)
-        pred = rf_reg.predict(input_data)[0]
-        pred = round(np.clip(pred, 1, 5), 2)
+        pred = float(np.clip(rf_reg.predict(input_data)[0], 1, 5))
 
-        col_r1, col_r2, col_r3 = st.columns([1,2,1])
+        col_r1, col_r2, col_r3 = st.columns([1, 2, 1])
         with col_r2:
-            st.success(f"### Predicted Rating: **{pred} / 5.0** ⭐")
-            stars = "⭐" * round(pred)
-            st.markdown(f"<h2 style='text-align:center'>{stars}</h2>", unsafe_allow_html=True)
+            st.success(f"### Predicted Rating: **{pred:.2f} / 5.0** ⭐")
+            st.markdown(f"<h2 style='text-align:center'>{'⭐' * round(pred)}</h2>", unsafe_allow_html=True)
             gauge = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=pred,
-                domain={'x': [0,1], 'y': [0,1]},
+                mode="gauge+number", value=pred,
+                domain={'x': [0, 1], 'y': [0, 1]},
                 title={'text': "Predicted Rating"},
                 gauge={
                     'axis': {'range': [1, 5]},
-                    'bar': {'color': "#2ca02c"},
+                    'bar':  {'color': "#2ca02c"},
                     'steps': [
                         {'range': [1, 2.5], 'color': "#f4cccc"},
                         {'range': [2.5, 3.5], 'color': "#fff2cc"},
-                        {'range': [3.5, 5], 'color': "#d9ead3"}
+                        {'range': [3.5, 5],   'color': "#d9ead3"},
                     ]
                 }
             ))
@@ -294,10 +426,10 @@ elif page == "🗺️ Visit Mode Prediction":
         sel_continent  = st.selectbox("Continent", list(continent_opts.keys()), key='cls_cont')
         continent_id   = continent_opts[sel_continent]
 
-        region_subset  = region_df[region_df['ContinentId'] == continent_id]
-        region_opts    = dict(zip(region_subset['Region'], region_subset['RegionId']))
-        sel_region     = st.selectbox("Region", list(region_opts.keys()) or ['Unknown'], key='cls_reg')
-        region_id      = region_opts.get(sel_region, 1)
+        region_subset = region_df[region_df['ContinentId'] == continent_id]
+        region_opts   = dict(zip(region_subset['Region'], region_subset['RegionId']))
+        sel_region    = st.selectbox("Region", list(region_opts.keys()) or ['Unknown'], key='cls_reg')
+        region_id     = region_opts.get(sel_region, 1)
 
         country_subset = country_df[country_df['RegionId'] == region_id]
         country_opts   = dict(zip(country_subset['Country'], country_subset['CountryId']))
@@ -307,12 +439,11 @@ elif page == "🗺️ Visit Mode Prediction":
         visit_year  = st.selectbox("Visit Year", list(range(2013, 2024)), index=9, key='cls_yr')
         visit_month = st.selectbox("Visit Month", list(range(1, 13)), key='cls_mn',
                                    format_func=lambda x: pd.Timestamp(2024, x, 1).strftime('%B'))
-
     with col2:
         st.subheader("Attraction & History")
-        type_opts     = dict(zip(type_df['AttractionType'], type_df['AttractionTypeId']))
-        sel_type      = st.selectbox("Attraction Type", list(type_opts.keys()), key='cls_type')
-        attr_type_id  = type_opts[sel_type]
+        type_opts    = dict(zip(type_df['AttractionType'], type_df['AttractionTypeId']))
+        sel_type     = st.selectbox("Attraction Type", list(type_opts.keys()), key='cls_type')
+        attr_type_id = type_opts[sel_type]
 
         attr_avg_rating  = st.slider("Attraction's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1, key='cls_ar')
         user_avg_rating  = st.slider("User's Historical Avg Rating", 1.0, 5.0, 4.0, 0.1, key='cls_ur')
@@ -322,18 +453,17 @@ elif page == "🗺️ Visit Mode Prediction":
     st.markdown("---")
     if st.button("🔮 Predict Visit Mode", type="primary", use_container_width=True):
         input_data = pd.DataFrame([[continent_id, region_id, country_id, visit_year, visit_month,
-                                    attr_type_id, attr_avg_rating, user_avg_rating, user_visit_count,
-                                    rating_given]],
+                                    attr_type_id, attr_avg_rating, user_avg_rating,
+                                    user_visit_count, rating_given]],
                                   columns=FEATURES_CLS)
         pred_mode = best_cls.predict(input_data)[0]
         proba     = best_cls.predict_proba(input_data)[0]
         classes   = best_cls.classes_
         mode_name = mode_map.get(pred_mode, "Unknown")
-
         mode_icons = {1: "💼", 2: "💑", 3: "👨‍👩‍👧‍👦", 4: "👫", 5: "🧍"}
         icon = mode_icons.get(pred_mode, "🗺️")
 
-        col_r1, col_r2, col_r3 = st.columns([1,2,1])
+        col_r1, col_r2, col_r3 = st.columns([1, 2, 1])
         with col_r2:
             st.success(f"### Predicted Visit Mode: {icon} **{mode_name}**")
 
@@ -353,7 +483,6 @@ elif page == "🗺️ Visit Mode Prediction":
 # ─────────────────────────────────────────────
 elif page == "🎯 Recommendations":
     st.title("🎯 Personalized Attraction Recommendations")
-    st.markdown("Get personalized attraction recommendations based on your profile and similar users.")
     st.markdown("---")
 
     tab1, tab2 = st.tabs(["Collaborative Filtering", "Content-Based Filtering"])
@@ -361,40 +490,31 @@ elif page == "🎯 Recommendations":
     with tab1:
         st.subheader("Collaborative Filtering")
         st.markdown("Recommend attractions based on similar users' ratings and preferences.")
-
-        # Pick a user ID
-        all_users = sorted(pivot_filled.index.tolist())
-        user_id = st.selectbox("Select User ID", all_users[:500], index=0)
+        user_id = st.selectbox("Select User ID", sorted(pivot_filled.index.tolist())[:500])
         top_n   = st.slider("Number of Recommendations", 5, 20, 10)
 
         if st.button("🎯 Get Recommendations (Collaborative)", type="primary"):
-            user_idx = pivot_filled.index.get_loc(user_id)
-            user_vec = pivot_filled.iloc[user_idx].values.reshape(1, -1)
+            user_idx  = pivot_filled.index.get_loc(user_id)
+            user_vec  = pivot_filled.iloc[user_idx].values.reshape(1, -1)
             distances, indices = knn_model.kneighbors(user_vec, n_neighbors=11)
-
-            # Collect similar users' unvisited attractions
-            similar_users = indices.flatten()[1:]
             visited = set(pivot_filled.iloc[user_idx][pivot_filled.iloc[user_idx] > 0].index)
 
             scores = {}
-            for sim_idx in similar_users:
-                sim_user_ratings = pivot_filled.iloc[sim_idx]
-                for att_id, rat in sim_user_ratings.items():
+            for sim_idx in indices.flatten()[1:]:
+                for att_id, rat in pivot_filled.iloc[sim_idx].items():
                     if rat > 0 and att_id not in visited:
                         scores[att_id] = scores.get(att_id, 0) + rat
 
             top_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
             if top_recs:
-                rec_ids = [r[0] for r in top_recs]
+                rec_ids    = [r[0] for r in top_recs]
                 rec_scores = [r[1] for r in top_recs]
                 rec_df = item[item['AttractionId'].isin(rec_ids)].copy()
                 rec_df = rec_df.merge(
                     pd.DataFrame({'AttractionId': rec_ids, 'Score': rec_scores}),
                     on='AttractionId', how='left'
-                ).merge(type_df, on='AttractionTypeId', how='left')
-                rec_df = rec_df.sort_values('Score', ascending=False)
+                ).merge(type_df, on='AttractionTypeId', how='left').sort_values('Score', ascending=False)
 
-                st.success(f"Top {top_n} recommended attractions for User {user_id}:")
                 fig = px.bar(rec_df.head(top_n), x='Score', y='Attraction', orientation='h',
                              color='Score', color_continuous_scale='Tealgrn',
                              hover_data=['AttractionType','AttractionAddress'],
@@ -407,28 +527,23 @@ elif page == "🎯 Recommendations":
 
     with tab2:
         st.subheader("Content-Based Filtering")
-        st.markdown("Suggest attractions similar to one you've enjoyed, based on type and features.")
-
-        type_list = type_df['AttractionType'].tolist()
-        sel_type  = st.selectbox("Select Attraction Type You Like", type_list)
+        sel_type  = st.selectbox("Select Attraction Type You Like", type_df['AttractionType'].tolist())
         top_n_cb  = st.slider("Number of Recommendations", 5, 20, 10, key='cb_n')
 
         if st.button("🎯 Get Recommendations (Content-Based)", type="primary"):
             type_id = type_df[type_df['AttractionType'] == sel_type]['AttractionTypeId'].values[0]
-            # Get attractions of same type, ranked by avg rating
             type_attractions = item[item['AttractionTypeId'] == type_id].copy()
             attr_ratings = df.groupby('AttractionId')['Rating'].agg(['mean','count']).reset_index()
             attr_ratings.columns = ['AttractionId','AvgRating','VisitCount']
             type_attractions = type_attractions.merge(attr_ratings, on='AttractionId', how='left')
-            type_attractions = type_attractions.dropna(subset=['AvgRating'])
-            type_attractions = type_attractions.sort_values('AvgRating', ascending=False).head(top_n_cb)
+            type_attractions = type_attractions.dropna(subset=['AvgRating']).sort_values('AvgRating', ascending=False).head(top_n_cb)
 
             if len(type_attractions):
                 fig = px.bar(type_attractions, x='AvgRating', y='Attraction', orientation='h',
                              color='AvgRating', color_continuous_scale='RdYlGn',
                              hover_data=['AttractionAddress','VisitCount'],
                              title=f"Top {sel_type} Attractions by Rating")
-                fig.update_layout(xaxis_range=[1,5])
+                fig.update_layout(xaxis_range=[1, 5])
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(type_attractions[['Attraction','AttractionAddress','AvgRating','VisitCount']],
                              use_container_width=True)
@@ -446,52 +561,41 @@ elif page == "📈 Model Performance":
 
     with tab1:
         st.subheader("Regression — Predicting Attraction Ratings")
-        st.markdown("**Target:** Rating (1–5) | **Best Model:** Random Forest Regressor")
-
-        reg_df_metrics = pd.DataFrame(reg_metrics).T.reset_index()
-        reg_df_metrics.columns = ['Model', 'R²', 'RMSE', 'MSE']
-
-        col1, col2, col3 = st.columns(3)
         best_r2 = max(reg_metrics.values(), key=lambda x: x['R2'])
-        col1.metric("Best R²", f"{best_r2['R2']:.4f}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Best R²",   f"{best_r2['R2']:.4f}")
         col2.metric("Best RMSE", f"{min(v['RMSE'] for v in reg_metrics.values()):.4f}")
-        col3.metric("Best MSE",  f"{min(v['MSE'] for v in reg_metrics.values()):.4f}")
+        col3.metric("Best MSE",  f"{min(v['MSE']  for v in reg_metrics.values()):.4f}")
 
-        st.dataframe(reg_df_metrics.style.format({'R²':'{:.4f}','RMSE':'{:.4f}','MSE':'{:.4f}'}),
-                     use_container_width=True)
+        reg_table = pd.DataFrame(reg_metrics).T.reset_index()
+        reg_table.columns = ['Model','R²','RMSE','MSE']
+        st.dataframe(reg_table.style.format({'R²':'{:.4f}','RMSE':'{:.4f}','MSE':'{:.4f}'}), use_container_width=True)
 
         fig = go.Figure()
-        models = list(reg_metrics.keys())
-        for metric in ['R²','RMSE']:
-            vals = [reg_metrics[m][metric.replace('²','2')] if metric == 'R²' else reg_metrics[m][metric] for m in models]
-            fig.add_trace(go.Bar(name=metric, x=models, y=vals))
+        for metric, key in [('R²','R2'), ('RMSE','RMSE')]:
+            fig.add_trace(go.Bar(name=metric, x=list(reg_metrics.keys()),
+                                 y=[reg_metrics[m][key] for m in reg_metrics]))
         fig.update_layout(barmode='group', title="Regression Model Comparison")
         st.plotly_chart(fig, use_container_width=True)
-
-        st.info("**Random Forest** achieves the best R² and lowest RMSE. The model explains ~74% of variance in user ratings, indicating strong predictive power for tourism satisfaction.")
+        st.info("Random Forest achieves the best R² and lowest RMSE, explaining ~74% of variance in user ratings.")
 
     with tab2:
         st.subheader("Classification — Predicting Visit Mode")
-        st.markdown(f"**Target:** Visit Mode (5 classes) | **Best Model:** {best_cls_name}")
-
-        cls_df_metrics = pd.DataFrame(cls_metrics).T.reset_index()
-        cls_df_metrics.columns = ['Model','Accuracy','F1','Precision','Recall']
-
         best_acc = max(cls_metrics.values(), key=lambda x: x['Accuracy'])
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Best Accuracy",  f"{best_acc['Accuracy']:.4f}")
-        col2.metric("Best F1 Score",  f"{max(v['F1'] for v in cls_metrics.values()):.4f}")
+        col2.metric("Best F1",        f"{max(v['F1'] for v in cls_metrics.values()):.4f}")
         col3.metric("Best Precision", f"{max(v['Precision'] for v in cls_metrics.values()):.4f}")
         col4.metric("Best Recall",    f"{max(v['Recall'] for v in cls_metrics.values()):.4f}")
 
-        st.dataframe(cls_df_metrics.style.format({c:'{:.4f}' for c in ['Accuracy','F1','Precision','Recall']}),
-                     use_container_width=True)
+        cls_table = pd.DataFrame(cls_metrics).T.reset_index()
+        cls_table.columns = ['Model','Accuracy','F1','Precision','Recall']
+        st.dataframe(cls_table.style.format({c:'{:.4f}' for c in ['Accuracy','F1','Precision','Recall']}), use_container_width=True)
 
-        # Radar chart for best model
-        categories = ['Accuracy','F1','Precision','Recall']
-        best_vals  = [cls_metrics[best_cls_name][c] for c in categories]
-        other_name = [k for k in cls_metrics if k != best_cls_name][0]
-        other_vals = [cls_metrics[other_name][c] for c in categories]
+        categories  = ['Accuracy','F1','Precision','Recall']
+        other_name  = [k for k in cls_metrics if k != best_cls_name][0]
+        best_vals   = [cls_metrics[best_cls_name][c] for c in categories]
+        other_vals  = [cls_metrics[other_name][c]    for c in categories]
 
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(r=best_vals + [best_vals[0]], theta=categories + [categories[0]],
@@ -499,22 +603,19 @@ elif page == "📈 Model Performance":
         fig.add_trace(go.Scatterpolar(r=other_vals + [other_vals[0]], theta=categories + [categories[0]],
                                       fill='toself', name=other_name))
         fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,1])),
-                          title="Classification Model Comparison (Radar Chart)")
+                          title="Classification Model Comparison")
         st.plotly_chart(fig, use_container_width=True)
 
-        st.info("**Note:** Visit mode classification is a 5-class problem with class imbalance. "
-                "The ~50% accuracy represents meaningful signal above random baseline (~20%) "
-                "for a 5-class problem. Further improvements can be achieved with additional "
-                "user behavioral features and oversampling techniques (SMOTE).")
+        st.info("~50% accuracy on a 5-class problem represents a 2.5× improvement over random baseline (20%).")
 
         st.subheader("Recommendation System")
         st.markdown("""
-        | Metric | Value |
-        |--------|-------|
-        | **Algorithm** | K-Nearest Neighbors (Collaborative Filtering) |
-        | **Similarity Metric** | Cosine Similarity |
-        | **Neighbors** | 10 similar users |
-        | **User Coverage** | 33,530 users |
-        | **Item Coverage** | 1,698 attractions |
-        | **Content-Based** | Attraction-type similarity with historical ratings |
+| Metric | Value |
+|--------|-------|
+| **Algorithm** | K-Nearest Neighbors (Collaborative Filtering) |
+| **Similarity Metric** | Cosine Similarity |
+| **Neighbors (k)** | 10 similar users |
+| **User Coverage** | 33,530 users |
+| **Item Coverage** | 1,698 attractions |
+| **Content-Based** | Attraction-type similarity with historical ratings |
         """)
